@@ -1,0 +1,184 @@
+#include <math_constants>
+#include <multisample>
+param float SIGMA = .3 : hidden();
+param float scaling  = 1 : range(0, 1);
+param float gamma    = 1   : range(.5, 3.);
+param float ev       = 0   : range(-10, +10);
+param float satur    = 0.5 : range(-1, 1);
+
+param float thresh_bend = 0.8 : range(0, 1);
+param float bending =     0.5 : range(0, 1);
+param float BWbend =       .5 : range(0,1);
+// Threshold for clipping of bright pixels
+param float clip_lum = 4.5 : logrange(1, 100);
+param bool brighten_only_pre = false : hidden();
+param float pre_blur = 5 : range(0, 100);
+param int blur_quality_pre = 16 : hidden();
+param bool brighten_only_post = false;
+param float post_blur = 200 : range(0, 500);
+param int blur_quality_post = 4 : range(1,16);
+// Distance to influence the pixels 2 times less
+param float half_dist= 100 : logrange(10, 1000);
+// Local color change to compensate saturation. Might look weird.
+param bool  color_adaptation = false;
+// Ensure very saturated colors do not clip.
+param bool  color_max = true;
+// Exposure for visualisation of local adaptation
+param float progr_blur_expo = 0.5 : logrange(0.1,1);
+// Strength of local adaptation
+param float str_local= 1 : range(0, 4);
+// Strength of bloom for overexposed pixels
+param float bloom_str = 100 : range(0, 200);
+param int bloom_quality = 8 : range(1, 16);
+
+
+
+image entree = file("foyer.tiff") : full_range();
+
+
+
+glsl vec3 random(vec2 position){
+	return vec3(
+		fract(sin(dot(position+fract(shadron_Time) ,vec2(12.9898,78.233))) * 43758.5453),
+		fract(sin(dot(position+fract(shadron_Time) ,vec2(78.233,12.9898))) * 43758.5453),
+		fract(sin(dot(position-fract(shadron_Time) ,vec2(12.9898,78.233))) * 43758.5453));
+}
+
+
+// Code partially from Shadron Tutorial
+glsl float blurWeight(float x) {
+	return exp(-0.5*(x*x)/(SIGMA*SIGMA));
+}
+
+template <TEXTURE, DIRECTION, QUALITY>
+glsl vec4 blur(vec2 coord) {
+	if(DIRECTION.x==0 && DIRECTION.y==0){
+		return texture(TEXTURE, coord);
+	}
+	vec4 total = vec4(0.0);
+	float totalWeight = 0.0;
+	for (int step = -QUALITY; step <= QUALITY; ++step) {
+		vec2 texCoord = coord + DIRECTION*float(step)/float(QUALITY)/(scaling*sizeof(entree));
+		float weight = blurWeight(float(step)/float(QUALITY));
+		total += weight*texture(TEXTURE, texCoord);
+		totalWeight += weight;
+	}
+	return total / totalWeight;
+}
+// End of code from Shadron Tutorial
+
+
+glsl vec3 tone(vec2 position){
+	vec3 color = texture(entree, position).rgb;
+	float exposure = pow(2, ev);
+	color *= exposure;
+	color = pow(color, vec3(gamma));
+	float blackandwhite = color.r + color.g + color.b;
+	blackandwhite/=3;
+	color = (1+satur)*color -satur*blackandwhite;
+	// bending
+	vec3 tobend = max(vec3(0), color-thresh_bend);
+	tobend = mix(tobend, vec3(tobend.r + tobend.g + tobend.b)/3, BWbend);
+	color -= bending*tobend;
+	return color;
+}
+
+image sortie = glsl(tone, scaling*sizeof(entree)) : full_range();
+
+glsl vec3 clip_authorized(vec2 position){
+	float real_clip_lum = clip_lum * pow(2, ev);
+	// Be sure the clip authorized stays the same after changing the bend setting
+	if (real_clip_lum > thresh_bend){
+		// Can be simplified, will do later.
+		real_clip_lum-=thresh_bend;
+		real_clip_lum*=1-bending;
+		real_clip_lum+=thresh_bend;
+	}
+	return max(vec3(0), texture(sortie, position).rgb-vec3(real_clip_lum));
+}
+
+image authorized_clipping = glsl(clip_authorized, scaling*sizeof(entree)) : full_range();
+
+glsl vec3 authorize_clip(vec2 position){
+	return texture(sortie, position).rgb-texture(authorized_clipping, position).rgb;
+}
+
+image sortie2 = glsl(authorize_clip, scaling*sizeof(entree)) : full_range(), hidden(), heavy_mode();
+
+glsl vec3 burned(vec2 position){
+	return max(vec3(0), texture(sortie2, position).rgb-vec3(1));
+}
+
+image burned_parts = glsl(burned, scaling*sizeof(entree)) : full_range(), heavy_mode(), hidden();
+
+// Code from Shadron Tutorial
+// Images smaller depending on strength of blur, we don't need huge ones
+image Hblur = glsl(blur<burned_parts, pre_blur*vec2(1.0, 0.0), blur_quality_pre>, sizeof(burned_parts)/vec2(max(.2*pre_blur,1),1)) : full_range(), map(clamp), heavy_mode(), hidden();
+image burned_blurred = glsl(blur<Hblur, pre_blur*vec2(0.0, 1.0), blur_quality_pre>, sizeof(burned_parts)/max(.2*pre_blur, 1)) : full_range(), heavy_mode();
+// End of code from Shadron Tutorial
+
+glsl vec3 progressive_blur(sampler2D self, vec2 position, float timeDelta){
+	vec3 burned = texture(burned_blurred, position).rgb;
+	if(brighten_only_pre){
+		burned = max(burned, texture(burned_parts, position).rgb);
+	}
+	if(!color_adaptation){
+		if (color_max){
+			burned = vec3(max(burned.r, max(burned.g, burned.b)));
+		}else{
+			burned = vec3(burned.r + burned.g + burned.b);
+			burned /= 3;
+		}
+	}
+	vec3 curr_color = max(texture(self, position).rgb, burned);
+	// curr_color = max(texture(self, position+vec2(PHI,0)/(scaling*sizeof(entree))).rgb, curr_color);
+
+	vec2 rand = random(position).xy;
+	float distance = 0.1*half_dist*rand.x/scaling;
+	float angle = TAU*rand.y;
+	vec2 place_sample = position + distance*vec2(sin(angle), cos(angle))/sizeof(entree);
+	place_sample.y = clamp(place_sample.y, 0.001, 0.999);
+	curr_color=max(texture(self, place_sample).rgb*exp(-distance/half_dist), curr_color);
+	return curr_color;
+}
+
+feedback progr_blur = glsl(progressive_blur, brighten_only_pre?scaling*sizeof(entree):sizeof(burned_blurred)) : full_range(), hidden();
+animation postblurH = glsl(blur<progr_blur, post_blur*vec2(1, 0), blur_quality_post>, min(sizeof(burned_blurred), sizeof(entree)/vec2(max(.1*post_blur,1),1))) : full_range(), map(clamp), hidden();
+animation postblurV = glsl(blur<postblurH, post_blur*vec2(0, 1), blur_quality_post>, min(sizeof(burned_blurred), sizeof(entree)/max(.1*post_blur, 1))) : full_range(), hidden();
+
+glsl vec3 visualize_progr_blur(vec2 position){
+	vec3 blurrycolor = texture(postblurV, position).rgb;
+	if(brighten_only_post){
+		blurrycolor = max(blurrycolor, texture(progr_blur, position).rgb);
+	}
+	return progr_blur_expo * blurrycolor;
+}
+
+animation visualisation_progressive_blur = glsl(visualize_progr_blur, sizeof(progr_blur)) : resizable();
+
+glsl vec3 local_adapt(vec2 position){
+	vec3 color = texture(sortie2, position).rgb;
+	vec3 blurrycolor = texture(postblurV, position).rgb;
+	if(brighten_only_post){
+		blurrycolor = max(blurrycolor, texture(progr_blur, position).rgb);
+	}
+	color+=texture(authorized_clipping, position).rgb;
+	color /= 1+str_local*blurrycolor;
+	return color;
+}
+
+animation adapted = glsl(local_adapt, scaling*sizeof(entree)) : full_range(), resizable();
+
+glsl vec4 stillburned(vec2 position){
+	return vec4(max(vec3(0), texture(adapted, position).rgb-1),1);
+}
+
+animation stillburning = glsl(stillburned, sizeof(adapted)) : full_range();
+// animation Hbloom = glsl(blur<stillburning, bloom_str*vec2(1, 0), bloom_quality>, sizeof(stillburning)) : full_range(), map(clamp), hidden();
+// animation Vbloom = glsl(blur<Hbloom, bloom_str*vec2(0, 1), bloom_quality>, sizeof(stillburning)) : full_range(), hidden();
+
+glsl vec3 blooming(vec2 position){
+	return texture(adapted, position).rgb + texture(Vbloom, position).rgb;
+}
+
+// animation bloomed = glsl(blooming, scaling*sizeof(entree));
